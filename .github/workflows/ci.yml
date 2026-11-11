@@ -38,7 +38,9 @@ jobs:
       - name: Check JavaScript syntax
         run: npm run check
 
-      - name: Test with coverage thresholds
+            - name: Check out frontend for model file
+              run: git clone --depth 1 https://github.com/gopichand-retail-apps/retailpulse-frontend.git ../retailpulse-frontend
+              - name: Test with coverage thresholds
         run: npm run test:cov
 
       - name: Audit dependencies
