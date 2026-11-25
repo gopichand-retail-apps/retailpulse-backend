@@ -7,7 +7,7 @@ import test from 'node:test';
 import { createApiServer, createCsv, loadModel } from './server.mjs';
 
 async function startTestServer(t, options = {}) {
-  const api = createApiServer({ databasePath: ':memory:', ...options });
+  const api = createApiServer({ databasePath: ':memory:', profile: 'demo', ...options });
   api.server.listen(0, '127.0.0.1');
   await once(api.server, 'listening');
   t.after(() => api.close());
@@ -371,4 +371,159 @@ test('validates a configured E2E origin before opening the database', async (t) 
     process.env[envName] = invalidOrigin;
     assert.throws(() => createApiServer({ databasePath: ':memory:' }), /HTTP loopback origin/);
   }
+});
+
+const csvHeaderRow = '"Record type","Name","Category","SKU","Net sales","Transactions","Units sold","Gross margin"';
+
+function sourceCsvRow(name, value) {
+  return `"Source","${name}","${value}","","","","",""`;
+}
+
+async function startEmptyInstall(t) {
+  const api = createApiServer({ databasePath: ':memory:' });
+  api.server.listen(0, '127.0.0.1');
+  await once(api.server, 'listening');
+  t.after(() => api.close());
+  return { api, baseUrl: `http://127.0.0.1:${api.server.address().port}` };
+}
+
+test('a fresh API reports an empty install with no sales, no stock numbers and no sample data', async (t) => {
+  const { api, baseUrl } = await startEmptyInstall(t);
+
+  assert.equal(api.profile, 'empty');
+  const dashboard = (await (await fetch(`${baseUrl}/api/v1/dashboard?days=30`)).json()).data;
+  assert.equal(dashboard.source.state, 'awaiting_first_sale');
+  assert.equal(dashboard.source.profile, 'empty');
+  assert.equal(dashboard.source.cutoffAt, null);
+
+  const products = (await (await fetch(`${baseUrl}/api/v1/products`)).json()).data;
+  assert.ok(products.length > 0);
+  assert.ok(products.every((product) => product.stockOnHand === 0));
+
+  const alerts = (await (await fetch(`${baseUrl}/api/v1/alerts`)).json()).data;
+  assert.ok(alerts.every((alert) => alert.triggered === false));
+  assert.deepEqual((await (await fetch(`${baseUrl}/api/v1/activity`)).json()).data, []);
+});
+
+test('sample sales are refused on an empty install, after the idempotency key is checked', async (t) => {
+  const { baseUrl } = await startEmptyInstall(t);
+
+  const missingKey = await fetch(`${baseUrl}/api/v1/sales/ingest`, { method: 'POST' });
+  assert.equal(missingKey.status, 400);
+  assert.equal((await missingKey.json()).error.code, 'IDEMPOTENCY_KEY_REQUIRED');
+
+  const refused = await fetch(`${baseUrl}/api/v1/sales/ingest`, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': 'retailpulse-empty-profile' },
+  });
+  const body = await refused.json();
+  assert.equal(refused.status, 409);
+  assert.equal(body.error.code, 'SAMPLE_SALES_DISABLED');
+  assert.equal(body.error.requestId, refused.headers.get('x-request-id'));
+
+  const dashboard = (await (await fetch(`${baseUrl}/api/v1/dashboard`)).json()).data;
+  assert.equal(dashboard.source.state, 'awaiting_first_sale');
+});
+
+test('the demo API reports its fixture source as connected and current', async (t) => {
+  const baseUrl = await startTestServer(t);
+  const dashboard = (await (await fetch(`${baseUrl}/api/v1/dashboard?days=30`)).json()).data;
+
+  assert.equal(dashboard.source.profile, 'demo');
+  assert.equal(dashboard.source.connection, 'fixture');
+  assert.equal(dashboard.source.state, 'current');
+  assert.deepEqual(dashboard.source.coverage, { daysWithSales: 30, daysInPeriod: 30 });
+});
+
+test('the export carries the source state, cutoff and coverage ahead of the sales rows', async (t) => {
+  const baseUrl = await startTestServer(t);
+  const rows = (await (await fetch(`${baseUrl}/api/v1/reports/export?days=30`)).text()).split('\r\n');
+
+  assert.equal(rows[0], csvHeaderRow);
+  assert.equal(rows[1], sourceCsvRow('Reporting state', 'Up to date'));
+  assert.equal(rows[2], sourceCsvRow('Source status', 'Synthetic demo feed (demo profile)'));
+  assert.match(rows[3], /^"Source","Reporting cutoff","\d{4}-\d{2}-\d{2}T[\d:.]+Z","","","","",""$/);
+  assert.equal(rows[4], sourceCsvRow('Coverage', '30 of 30 days with sales'));
+  assert.ok(rows.slice(5).some((row) => row.startsWith('"Store",')));
+  assert.ok(rows.slice(5).some((row) => row.startsWith('"Product",')));
+});
+
+test('an awaiting-first-sale export has source rows and no zero-filled sales rows', async (t) => {
+  const { baseUrl } = await startEmptyInstall(t);
+  const csv = await (await fetch(`${baseUrl}/api/v1/reports/export?days=7`)).text();
+
+  assert.equal(
+    csv,
+    [
+      csvHeaderRow,
+      sourceCsvRow('Reporting state', 'Awaiting first sale'),
+      sourceCsvRow('Source status', 'No sales source connected'),
+      sourceCsvRow('Reporting cutoff', 'No sale committed yet'),
+      sourceCsvRow('Coverage', '0 of 7 days with sales'),
+    ].join('\r\n'),
+  );
+});
+
+test('CSV source rows spell out a stale source with its cutoff and coverage', () => {
+  const source = {
+    profile: 'demo',
+    connection: 'fixture',
+    state: 'stale',
+    cutoffAt: '2026-11-20T17:03:00.000Z',
+    coverage: { daysWithSales: 27, daysInPeriod: 30 },
+  };
+  const rows = createCsv(loadModel(), [], [], source).split('\r\n');
+
+  assert.deepEqual(rows.slice(1), [
+    sourceCsvRow('Reporting state', 'Stale'),
+    sourceCsvRow('Source status', 'Synthetic demo feed (demo profile)'),
+    sourceCsvRow('Reporting cutoff', '2026-11-20T17:03:00.000Z'),
+    sourceCsvRow('Coverage', '27 of 30 days with sales'),
+  ]);
+});
+
+test('CSV source rows for a missing source keep the sales rows and the last cutoff', () => {
+  const source = {
+    profile: 'empty',
+    connection: 'none',
+    state: 'missing',
+    cutoffAt: '2026-11-20T17:03:00.000Z',
+    coverage: { daysWithSales: 4, daysInPeriod: 30 },
+  };
+  const store = { name: 'Harbor', revenueCents: 100, transactions: 1, unitsSold: 1, grossMarginCents: 40 };
+  const rows = createCsv(loadModel(), [store], [], source).split('\r\n');
+
+  assert.equal(rows[1], sourceCsvRow('Reporting state', 'Source missing'));
+  assert.equal(rows[2], sourceCsvRow('Source status', 'No sales source connected'));
+  assert.equal(rows[5], '"Store","Harbor","","","1.00","1","1","0.40"');
+});
+
+test('a well-formed client request ID is echoed and a malformed one is replaced', async (t) => {
+  const baseUrl = await startTestServer(t);
+  const clientId = 'attempt-4f9c2d1e-0001';
+
+  const echoed = await fetch(`${baseUrl}/api/v1/unknown`, { headers: { 'X-Request-ID': clientId } });
+  assert.equal(echoed.headers.get('x-request-id'), clientId);
+  assert.equal((await echoed.json()).error.requestId, clientId);
+
+  for (const malformed of ['short', 'has spaces in it', 'x'.repeat(129), '<script>alert(1)</script>']) {
+    const replaced = await fetch(`${baseUrl}/api/v1/health`, { headers: { 'X-Request-ID': malformed } });
+    assert.match(replaced.headers.get('x-request-id'), /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/);
+  }
+});
+
+test('browser preflights allow the per-attempt request ID header', async (t) => {
+  const baseUrl = await startTestServer(t);
+  const origin = loadModel().app.allowedOrigins[0];
+  const response = await fetch(`${baseUrl}/api/v1/sales/ingest`, {
+    method: 'OPTIONS',
+    headers: {
+      Origin: origin,
+      'Access-Control-Request-Method': 'POST',
+      'Access-Control-Request-Headers': 'idempotency-key,x-request-id',
+    },
+  });
+
+  assert.equal(response.status, 204);
+  assert.match(response.headers.get('access-control-allow-headers') ?? '', /x-request-id/i);
 });

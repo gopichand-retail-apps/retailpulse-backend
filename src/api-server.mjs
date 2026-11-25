@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, resolve } from 'node:path';
@@ -6,7 +5,7 @@ import { createAnalyticsRepository } from './analytics.repository.mjs';
 import { APP_VERSION } from './app-version.mjs';
 import { handleApiRequest } from './api-routes.mjs';
 import { loadModel } from './model.mjs';
-import { getAllowedOrigins, getTraceId, sendCsv, sendJson, writeLog } from './http-utils.mjs';
+import { getAllowedOrigins, getTraceId, readRequestId, sendCsv, sendJson, writeLog } from './http-utils.mjs';
 
 function createRequestContext(response, requestId) {
   const state = {
@@ -63,7 +62,7 @@ function applyCors({ request, response, context, model, allowedOrigins }) {
 
   response.setHeader('Access-Control-Allow-Origin', origin);
   response.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS');
-  response.setHeader('Access-Control-Allow-Headers', 'Content-Type, Idempotency-Key, traceparent');
+  response.setHeader('Access-Control-Allow-Headers', 'Content-Type, Idempotency-Key, X-Request-ID, traceparent');
   response.setHeader('Access-Control-Expose-Headers', 'X-Request-ID, X-Trace-ID');
   return true;
 }
@@ -106,7 +105,7 @@ function writeRequestLog(request, context, traceId, startedAt) {
 
 async function handleHttpRequest({ request, response, model, repository, allowedOrigins }) {
   const startedAt = performance.now();
-  const requestId = randomUUID();
+  const requestId = readRequestId(request.headers['x-request-id']);
   const traceId = getTraceId(request.headers.traceparent);
   const context = createRequestContext(response, requestId);
   setSecurityHeaders(response, requestId, traceId);
@@ -125,18 +124,19 @@ async function handleHttpRequest({ request, response, model, repository, allowed
   }
 }
 
-export function createApiServer({ databasePath = 'data/retailpulse.sqlite', model = loadModel() } = {}) {
+export function createApiServer({ databasePath = 'data/retailpulse.sqlite', model = loadModel(), profile } = {}) {
   const allowedOrigins = getAllowedOrigins(model);
   if (databasePath !== ':memory:') {
     mkdirSync(dirname(resolve(databasePath)), { recursive: true });
   }
-  const repository = createAnalyticsRepository({ databasePath, model });
+  const repository = createAnalyticsRepository({ databasePath, model, profile });
   const server = createServer((request, response) =>
     handleHttpRequest({ request, response, model, repository, allowedOrigins }),
   );
 
   return {
     server,
+    profile: repository.getProfile(),
     close: () =>
       new Promise((resolve, reject) => {
         server.close((error) => {

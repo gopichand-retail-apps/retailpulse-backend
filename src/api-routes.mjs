@@ -161,6 +161,15 @@ function postIngestion({ complete, repository, request, requestId, model }) {
     });
     return;
   }
+  if (repository.getProfile() !== 'demo') {
+    completeErrorWithId(complete, {
+      requestId,
+      status: 409,
+      code: 'SAMPLE_SALES_DISABLED',
+      message: model.copy.errors.sampleSalesDisabled,
+    });
+    return;
+  }
   const result = repository.ingestSales(idempotencyKey);
   complete(result.replayed ? 200 : 201, { data: result });
 }
@@ -171,7 +180,7 @@ function isValidIdempotencyKey(value) {
 
 function getExport({ completeCsv, repository, filters, ranges, model }) {
   const dashboard = repository.getDashboard(filters);
-  const csv = createCsv(model, dashboard.stores, repository.getProducts(filters, ranges));
+  const csv = createCsv(model, dashboard.stores, repository.getProducts(filters, ranges), dashboard.source);
   completeCsv(200, csv, model.app.exportFilename);
 }
 

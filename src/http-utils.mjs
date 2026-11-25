@@ -1,4 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import { SOURCE_STATES } from './analytics.source.mjs';
+
+const CLIENT_REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
+
+/** A client may name each attempt; anything that is not a short, plain token is replaced. */
+export function readRequestId(headerValue) {
+  return typeof headerValue === 'string' && CLIENT_REQUEST_ID_PATTERN.test(headerValue) ? headerValue : randomUUID();
+}
 
 export function sendJson(response, status, body) {
   response.writeHead(status, {
@@ -121,9 +129,34 @@ function escapeCsvCell({ value, isText }) {
   return `"${cell.replaceAll('"', '""')}"`;
 }
 
-export function createCsv(model, stores, products) {
+function fillTemplate(template, values) {
+  return template.replace(/\{(\w+)\}/g, (_, key) => String(values[key]));
+}
+
+function createSourceRows(model, source) {
+  const { copy } = model;
+  const coverage = fillTemplate(copy.sourceCoverageValue, {
+    covered: source.coverage.daysWithSales,
+    total: source.coverage.daysInPeriod,
+  });
+  return [
+    [copy.sourceStateLabel, copy.sourceStates[source.state]],
+    [copy.sourceStatusLabel, copy.sourceConnections[source.connection]],
+    [copy.sourceCutoffLabel, source.cutoffAt ?? copy.sourceNoCutoff],
+    [copy.sourceCoverageLabel, coverage],
+  ].map(([label, value]) => [
+    csvText(model.reports.recordTypes.source),
+    csvText(label),
+    csvText(value),
+    ...Array.from({ length: 5 }, () => csvText('')),
+  ]);
+}
+
+export function createCsv(model, stores, products, source) {
   const headers = model.reports.csvHeaders.map(csvText);
   const rows = [headers];
+  if (source) rows.push(...createSourceRows(model, source));
+  if (source?.state === SOURCE_STATES.awaitingFirstSale) return rows.map(joinCsvRow).join('\r\n');
   for (const store of stores) {
     rows.push([
       csvText(model.reports.recordTypes.store),
@@ -148,7 +181,11 @@ export function createCsv(model, stores, products) {
       csvNumber((product.grossMarginCents / 100).toFixed(2)),
     ]);
   }
-  return rows.map((row) => row.map(escapeCsvCell).join(',')).join('\r\n');
+  return rows.map(joinCsvRow).join('\r\n');
+}
+
+function joinCsvRow(row) {
+  return row.map(escapeCsvCell).join(',');
 }
 
 export async function readJsonBody(request, maximumBytes) {
