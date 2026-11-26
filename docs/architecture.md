@@ -203,11 +203,13 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[Select Add latest sales] --> B[Generate idempotency key]
+    A[Select Add latest sales] --> B[Reuse the pending intent key or create one]
     B --> C[Browser preflight for POST]
-    C --> D[POST sales/ingest]
+    C --> D[POST sales/ingest with Idempotency-Key and a new X-Request-ID]
     D --> E[API validates idempotency key]
-    E --> F{Key already processed?}
+    E --> P{Demo profile?}
+    P -->|No| R[409 SAMPLE_SALES_DISABLED; client discards the key]
+    P -->|Yes| F{Key already processed?}
     F -->|Yes| G[Return prior batch result]
     F -->|No| H[Insert configured sales patterns in a transaction]
     H --> I[Persist batch key and activity event]
@@ -222,8 +224,12 @@ flowchart TD
 flowchart TD
     A[Select Export report] --> B[GET report export with active filters]
     B --> C[API validates filter values]
-    C --> D[Repository calculates store and product results]
-    D --> E[Escape CSV cells and construct report]
+    C --> D[Repository calculates the source summary, store and product results]
+    D --> S{Awaiting first sale?}
+    S -->|Yes| T[Source rows only]
+    S -->|No| U[Source rows, then store and product rows]
+    T --> E[Escape CSV cells and construct report]
+    U --> E
     E --> F[Return CSV attachment]
     F --> G[Browser downloads configured filename]
     G --> H[Announce export result]
@@ -316,6 +322,36 @@ erDiagram
     }
 ```
 
+### Install profile and reporting source (RP-01)
+
+`app_settings` holds `profile` (`empty` or `demo`) next to `seed_version`. [analytics.source.mjs](../src/analytics.source.mjs) resolves it when the repository opens:
+
+- A stored profile always wins.
+- A database with sales but no stored profile predates profiles and is treated as `demo`.
+- A fresh database takes `RETAILPULSE_PROFILE`, or `empty` when it is unset.
+- A request that conflicts with the stored profile fails before anything is seeded, and the database handle is closed.
+
+Only `demo` seeds fixture sales and stock snapshots. `empty` seeds the catalog with `stock_on_hand = 0`, which the UI shows as unavailable.
+
+The reporting source summary is derived per request; nothing is stored for it. `connection` follows the profile (`fixture` for demo, `none` for empty), and no external producer exists yet. [getSourceActivity](../src/analytics.query.mjs) supplies four values:
+
+| Value | Meaning |
+| --- | --- |
+| total committed sales | count of all sale facts |
+| cutoff | latest sale at or before now |
+| scope sales | sales in the selected period and filters |
+| coverage | days in the period that have any sale, regardless of store or category |
+
+[deriveSourceState](../src/analytics.source.mjs) applies these rules in order:
+
+1. No sale at all gives `awaiting_first_sale`, whether or not a source is connected.
+2. Sales without a connected source give `missing`.
+3. A cutoff strictly older than `data.source.staleAfterHours` gives `stale`.
+4. No sales in scope gives `empty_period`, where zero is accurate.
+5. Otherwise the state is `current`.
+
+Alerts never trigger while the state is `awaiting_first_sale`. Trading dates are UTC days, as in the rest of the API.
+
 The API owns `stores`, `products`, `sales_facts`, `alert_rules`, `ingestion_batches`, `activity_events`, and `app_settings`. Sales amounts are stored as integer cents. Ingestion uses idempotency keys; alert changes and batch records are persisted transactionally. Seed records and labels come from `retailpulse-model.json`, whose strict envelope contains `version`, `appId`, `locale`, `messages`, and `data`. Backend unit tests use in-memory SQLite; the running service uses its configured local SQLite file.
 
 ## 7. API and internal contracts
@@ -334,11 +370,18 @@ All business routes are under `/api/v1`; the API returns request IDs and stable 
 | `GET /activity`, `GET /reports/export`                                 | Activity and filtered CSV export                  |
 | `POST /sales/ingest`                                                   | Idempotent insertion of configured sales patterns |
 
+Additive changes for RP-01 (2026-11-26):
+
+- **Dashboard:** `GET /dashboard` adds `source: { profile, connection, state, cutoffAt, coverage: { daysWithSales, daysInPeriod } }`. Existing fields are unchanged.
+- **Export:** `GET /reports/export` adds four `Source` rows after the header: reporting state, source status, reporting cutoff, and coverage. An `awaiting_first_sale` export has no store or product rows.
+- **Ingest:** `POST /sales/ingest` returns `409 SAMPLE_SALES_DISABLED` outside the demo profile. That check runs after idempotency-key validation, which still returns 400.
+- **Request IDs:** a client `X-Request-ID` matching `^[A-Za-z0-9._:-]{8,128}$` is used as the request ID, echoed in the response and logged. Anything else is replaced with a UUID. CORS allows the header.
+
 There is no authentication or resource ownership layer today. The API binds to loopback addresses for local use; it must not be exposed externally until identity and server-side authorization are implemented.
 
 ## 8. Security, privacy, and egress
 
-Current release limitation: **No authentication or authorization: keep the API loopback-only. Four formatting failures and desktop-to-320px Products overflow remain in the baseline; fresh mobile viewports pass.**
+Current release limitation: **No authentication or authorization: keep the API loopback-only. The recorded formatting failures remain (one in this repository).** RP-03 (location-scoped access) is in design and needs a caller identity first.
 
 ### Identity and authorization
 
@@ -376,10 +419,10 @@ Configured npm scripts, from this repository with Node **24.15.0**; use `npm.cmd
 | `npm.cmd run dev`          | `node --watch src/main.mjs`                                                                                                                                                                                                                                                                                                                                                                              |
 | `npm.cmd run start`        | `node src/main.mjs`                                                                                                                                                                                                                                                                                                                                                                                      |
 | `npm.cmd run test`         | `node --test`                                                                                                                                                                                                                                                                                                                                                                                            |
-| `npm.cmd run test:cov`     | `c8 --all --include=src/api-server.mjs --include=src/api-routes.mjs --include=src/http-utils.mjs --include=src/model.mjs --include=src/analytics.repository.mjs --include=src/analytics.metrics.mjs --include=src/analytics.query.mjs --include=src/analytics.seed.mjs --exclude=src/**/*.test.mjs --reporter=text --check-coverage --lines=90 --statements=90 --functions=90 --branches=90 node --test` |
+| `npm.cmd run test:cov`     | `c8 --all --include=src/api-server.mjs --include=src/api-routes.mjs --include=src/http-utils.mjs --include=src/model.mjs --include=src/analytics.repository.mjs --include=src/analytics.metrics.mjs --include=src/analytics.query.mjs --include=src/analytics.seed.mjs --include=src/analytics.source.mjs --exclude=src/**/*.test.mjs --reporter=text --check-coverage --lines=90 --statements=90 --functions=90 --branches=90 node --test` |
 | `npm.cmd run lint`         | `eslint . --max-warnings=0`                                                                                                                                                                                                                                                                                                                                                                              |
 | `npm.cmd run format:check` | `prettier --check 'src/**/*.mjs' '.github/workflows/*.yml' 'package.json'`                                                                                                                                                                                                                                                                                                                               |
-| `npm.cmd run check`        | `node --check src/main.mjs && node --check src/server.mjs && node --check src/api-server.mjs && node --check src/api-routes.mjs && node --check src/http-utils.mjs && node --check src/model.mjs && node --check src/analytics.repository.mjs && node --check src/analytics.metrics.mjs && node --check src/analytics.query.mjs && node --check src/analytics.seed.mjs`                                  |
+| `npm.cmd run check`        | `node --check src/main.mjs && node --check src/server.mjs && node --check src/api-server.mjs && node --check src/api-routes.mjs && node --check src/http-utils.mjs && node --check src/model.mjs && node --check src/analytics.repository.mjs && node --check src/analytics.metrics.mjs && node --check src/analytics.query.mjs && node --check src/analytics.seed.mjs && node --check src/analytics.source.mjs`                                  |
 
 Install with `npm.cmd ci` and retain [package-lock.json](../package-lock.json). Registry access is required for a clean dependency installation. These commands describe the configured checks; execution results are listed in section 13.
 
@@ -408,6 +451,10 @@ CI configuration is listed in section 3. Run the configured checks before mergin
   validated before use. SQLite reads use bound parameters.
 - **Safe output:** CSV text cells that can trigger spreadsheet formulas are
   prefixed before quoting; numeric report cells are not altered.
+- **No invented figures (RP-01):** a database keeps the profile it was created
+  with; fixtures are never mixed into an empty install. Awaiting-first-sale,
+  an accurate zero, stale and missing are distinct states on screen and in the
+  export.
 - **Abortable browser reads:** route/filter changes cancel stale API reads;
   product search is debounced before network requests. There is no shared
   client cache or read-request deduplication layer.
@@ -427,6 +474,8 @@ The two Git repositories remain separate. Each owns one maintained README and th
 | Repository-local architecture    | Guide available in this checkout and linked from README           | docs/architecture.md; README.md          | Documented and validated                                      | File, link, and diagram checks         | Keep documentation consistent with source changes                                                                                                                                    |
 | API composition and domain state | Preserve existing workflows and failure states                    | src/analytics.metrics.mjs and source map | Implemented; application verification limits are listed below | Current source and existing app design | No authentication or authorization: keep the API loopback-only. Four formatting failures and desktop-to-320px Products overflow remain in the baseline; fresh mobile viewports pass. |
 | Public deployment                | Verified identity, data durability, recovery, and hosted behavior | Existing deployment/API boundaries       | Needs separate hardening/verification                         | No new hosted evidence                 | Local checks do not establish production readiness                                                                                                                                   |
+| RP-01 source-aware states        | Awaiting first sale, accurate zero, stale/missing cutoff and coverage on screen and in the export; empty install invents nothing | src/analytics.source.mjs, analytics.query.mjs, http-utils.mjs | Implemented on `feature/rp-01-source-state-and-resize`; external sources stay disabled | analytics.source/repository/server tests | No real producer yet (RP-02); trading dates are UTC days |
+| RP-03 location scope             | A manager sees only granted locations, including CSV, activity and drilldowns | Not implemented | Design awaiting owner approval | Stage B evidence file | Needs a caller identity first |
 
 ## 13. Dated verification and limitations
 
@@ -436,6 +485,18 @@ Last documentation review: **2026-11-09**. The checks below distinguish document
 - New application tests/builds, coverage, dependency audits, browser/device accessibility/performance, hosted CI, and Vercel deployment: **not rerun for the documentation updates**.
 - Frontend production builds passed on 2026-11-09 with Node 24.15.0. Build success does not establish that all application quality gates pass.
 - Outstanding baseline limit: No authentication or authorization: keep the API loopback-only. Four formatting failures and desktop-to-320px Products overflow remain in the baseline; fresh mobile viewports pass.
+
+**2026-11-26, branch `feature/rp-01-source-state-and-resize` (RP-01), Node 24.15.0, Windows.** These ran on a shared machine at 57–100% CPU from other workloads.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Lint | `npm.cmd run lint` | passed |
+| Syntax | `npm.cmd run check` | passed |
+| Tests and coverage | `npm.cmd run test:cov` | 56/56; 100% statements, lines and functions, 97.74% branches; `analytics.source.mjs` at 100% on all four |
+| Dependency audit | `npm.cmd audit` | 0 vulnerabilities |
+| Format | portable Prettier check | failed, only on the recorded `src/app-version.mjs` |
+
+One earlier `node --test` run reported 33 tests and 1 failure, a whole file ending early. It did not recur in the 16 runs that followed, and its cause is unknown. Frontend browser checks against this API are recorded in the frontend guide.
 
 The baseline results below record earlier validation. Re-run the listed commands against the current revision before release.
 

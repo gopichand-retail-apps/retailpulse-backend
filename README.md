@@ -14,7 +14,19 @@ Health: http://127.0.0.1:5702/api/v1/health. Direct startup stores data under `d
 
 The API reads its seed/content contract from the adjacent frontend at `../retailpulse-frontend/public/retailpulse-model.json`. Clone both repositories as siblings before starting it; this existing file dependency is not a network integration. Backend configuration is read from process environment variables; creating a .env file alone does not load it.
 
-Known release gaps: No authentication or authorization: keep the API loopback-only. Four formatting failures and desktop-to-320px Products overflow remain in the baseline; fresh mobile viewports pass.
+Known release gaps: No authentication or authorization: keep the API loopback-only. The recorded formatting failure in `src/app-version.mjs` remains (the frontend repository records three more).
+
+## Install profile and reporting source (RP-01)
+
+A fresh install is **empty**: no invented sales, no seeded stock numbers, and `POST /api/v1/sales/ingest` returns `409 SAMPLE_SALES_DISABLED`. Synthetic fixtures are opt-in with `RETAILPULSE_PROFILE=demo`. The store, product and alert-rule catalog is seeded in both profiles.
+
+| `RETAILPULSE_PROFILE` | Fresh database | Existing database |
+| --- | --- | --- |
+| unset or empty | `empty` | keeps the profile it was created with; a database that already holds sales but predates profiles is treated as `demo` |
+| `empty` or `demo` | that profile | must match the stored profile, otherwise startup fails rather than mixing fixtures into an empty install |
+| anything else | startup fails | startup fails |
+
+The profile is stored in the existing `app_settings` table; there is no schema change. `GET /api/v1/dashboard` returns a `source` object (`profile`, `connection`, `state`, `cutoffAt`, `coverage`). The state is one of `awaiting_first_sale`, `empty_period`, `current`, `stale` or `missing`. The CSV export starts with the same four source rows, and an awaiting export carries no zero-filled sales rows. The freshness window is `data.source.staleAfterHours` in the content model. No external sales source exists yet, so none can be connected.
 
 Node.js API for the RetailPulse analytics workspace. This repository owns HTTP validation, report calculations, SQLite persistence, alert updates, synthetic sales ingestion, exports, and structured request logging. The React frontend is a separate repository.
 
@@ -27,7 +39,7 @@ npm ci
 npm run dev
 ```
 
-The API binds to `127.0.0.1:5702`. `GET /api/v1/health` is the readiness endpoint. The frontend on port 5701 calls versioned `/api/v1` routes. `RETAILPULSE_DB_PATH` selects the local SQLite file; by default it is `data/retailpulse.sqlite` under this repository.
+The API binds to `127.0.0.1:5702`. `GET /api/v1/health` is the readiness endpoint. The frontend on port 5701 calls versioned `/api/v1` routes. `RETAILPULSE_DB_PATH` selects the local SQLite file; by default it is `data/retailpulse.sqlite` under this repository. `RETAILPULSE_PROFILE=demo` starts a fresh database with synthetic fixtures; see below.
 
 ```sh
 npm run format:check
