@@ -38,6 +38,13 @@ jobs:
       - name: Check JavaScript syntax
         run: npm run check
 
+      - name: Check out the matching frontend for the model file
+        run: |
+          repo=https://github.com/gopichand-retail-apps/retailpulse-frontend.git
+          ref="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          git ls-remote --exit-code --heads "$repo" "$ref" > /dev/null || ref=main
+          git clone --depth 1 --branch "$ref" "$repo" ../retailpulse-frontend
+
       - name: Test with coverage thresholds
         run: npm run test:cov
 
