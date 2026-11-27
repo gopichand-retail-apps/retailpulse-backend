@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { createAnalyticsRepository } from './analytics.repository.mjs';
 import { aggregateSales, createRange, mapMetric } from './analytics.metrics.mjs';
 import { seedSales } from './analytics.seed.mjs';
 import { loadModel } from './server.mjs';
 
-function createTestRepository(t, model = loadModel()) {
-  const repository = createAnalyticsRepository({ databasePath: ':memory:', model });
+function createTestRepository(t, model = loadModel(), profile = 'demo') {
+  const repository = createAnalyticsRepository({ databasePath: ':memory:', model, profile });
   t.after(() => repository.close());
   return repository;
 }
@@ -222,4 +226,162 @@ test('rejects seed patterns that reference unavailable products', () => {
   };
 
   assert.throws(() => seedSales(database, model, new Date('2026-11-01T00:00:00.000Z')), /unknown product/);
+});
+
+const dayMs = 24 * 60 * 60 * 1000;
+const staleWindowMs = 36 * 60 * 60 * 1000;
+
+function openRepository(t, options) {
+  const repository = createAnalyticsRepository({ model: loadModel(), ...options });
+  t.after(() => repository.close());
+  return repository;
+}
+
+function currentRanges(days = 30) {
+  const current = createRange(days, new Date());
+  return { current, previous: createRange(days, new Date(new Date(current.start).getTime() - 1)) };
+}
+
+function createTempDatabasePath(t) {
+  const directory = mkdtempSync(join(tmpdir(), 'retailpulse-profile-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  return join(directory, 'retailpulse.sqlite');
+}
+
+function openAndClose(options) {
+  const repository = createAnalyticsRepository({ model: loadModel(), ...options });
+  const result = { profile: repository.getProfile(), dashboard: repository.getDashboard(allStores) };
+  repository.close();
+  return result;
+}
+
+function forgetStoredProfile(databasePath) {
+  const raw = new DatabaseSync(databasePath);
+  raw.exec("DELETE FROM app_settings WHERE key = 'profile'");
+  raw.close();
+}
+
+test('a fresh install defaults to the empty profile and shows no invented numbers', (t) => {
+  const model = loadModel();
+  const repository = openRepository(t, { databasePath: ':memory:', model });
+  const dashboard = repository.getDashboard(allStores);
+
+  assert.equal(repository.getProfile(), 'empty');
+  assert.deepEqual(dashboard.source, {
+    profile: 'empty',
+    connection: 'none',
+    state: 'awaiting_first_sale',
+    cutoffAt: null,
+    coverage: { daysWithSales: 0, daysInPeriod: 30 },
+  });
+  assert.equal(dashboard.metrics.revenueCents, 0);
+  assert.equal(dashboard.metrics.transactions, 0);
+  assert.equal(dashboard.stores.length, model.seed.stores.length);
+  assert.ok(repository.getProducts(allStores, currentRanges()).every((product) => product.stockOnHand === 0));
+  assert.deepEqual(repository.getActivity(10), []);
+});
+
+test('the demo profile seeds fixture sales, stock snapshots and a recent cutoff', (t) => {
+  const model = loadModel();
+  const repository = openRepository(t, { databasePath: ':memory:', model, profile: 'demo' });
+  const { source } = repository.getDashboard(allStores);
+  const products = repository.getProducts(allStores, currentRanges());
+
+  assert.equal(repository.getProfile(), 'demo');
+  assert.equal(source.connection, 'fixture');
+  assert.equal(source.state, 'current');
+  assert.deepEqual(source.coverage, { daysWithSales: 30, daysInPeriod: 30 });
+  assert.ok(Date.parse(source.cutoffAt) <= Date.now());
+  assert.ok(Date.now() - Date.parse(source.cutoffAt) < staleWindowMs);
+  for (const seeded of model.seed.products) {
+    assert.equal(products.find((product) => product.id === seeded.id).stockOnHand, seeded.stockOnHand);
+  }
+});
+
+test('a connected source with no sales in the filtered scope reports an accurate zero', (t) => {
+  const repository = openRepository(t, { databasePath: ':memory:', profile: 'demo' });
+  const dashboard = repository.getDashboard({ days: 30, storeId: 'store-harbor', category: 'beauty' });
+
+  assert.equal(dashboard.source.state, 'empty_period');
+  assert.equal(dashboard.metrics.revenueCents, 0);
+  assert.deepEqual(dashboard.source.coverage, { daysWithSales: 30, daysInPeriod: 30 });
+  assert.ok(dashboard.source.cutoffAt);
+});
+
+test('an idle source turns stale and keeps reporting the cutoff it stopped at', (t) => {
+  const repository = openRepository(t, { databasePath: ':memory:', profile: 'demo' });
+  const seeded = repository.getDashboard(allStores).source;
+  const stale = repository.getDashboard(allStores, new Date(Date.now() + 3 * dayMs)).source;
+
+  assert.equal(stale.state, 'stale');
+  assert.ok(Date.parse(stale.cutoffAt) >= Date.parse(seeded.cutoffAt));
+  assert.ok(stale.coverage.daysWithSales > 0);
+  assert.ok(stale.coverage.daysWithSales < stale.coverage.daysInPeriod);
+});
+
+test('a connected demo install with no sales yet is awaiting its first sale until one is committed', (t) => {
+  const model = loadModel();
+  model.seed.salesDays = 0;
+  const repository = openRepository(t, { databasePath: ':memory:', model, profile: 'demo' });
+  const before = repository.getDashboard(allStores).source;
+
+  assert.equal(before.state, 'awaiting_first_sale');
+  assert.equal(before.connection, 'fixture');
+  assert.equal(before.cutoffAt, null);
+
+  repository.ingestSales('first-committed-batch');
+  const after = repository.getDashboard(allStores).source;
+  assert.equal(after.state, 'current');
+  assert.ok(after.coverage.daysWithSales >= 1);
+});
+
+test('alerts never trigger while the install is awaiting its first sale', (t) => {
+  const model = loadModel();
+  model.seed.alerts = [
+    { ...model.seed.alerts[0], id: 'always', metricKey: 'revenueCents', operator: '<', threshold: 1e15 },
+  ];
+  const repository = openRepository(t, { databasePath: ':memory:', model, profile: 'empty' });
+
+  assert.equal(repository.getAlerts(allStores)[0].value, 0);
+  assert.equal(repository.getAlerts(allStores)[0].triggered, false);
+});
+
+test('an empty install stays empty across restarts and refuses a demo request', (t) => {
+  const databasePath = createTempDatabasePath(t);
+
+  assert.equal(openAndClose({ databasePath, profile: 'empty' }).profile, 'empty');
+  assert.throws(
+    () => createAnalyticsRepository({ databasePath, model: loadModel(), profile: 'demo' }),
+    /conflicts with the database profile/,
+  );
+  const reopened = openAndClose({ databasePath });
+  assert.equal(reopened.profile, 'empty');
+  assert.equal(reopened.dashboard.source.state, 'awaiting_first_sale');
+});
+
+test('a demo install keeps its fixtures across restarts and refuses an empty request', (t) => {
+  const databasePath = createTempDatabasePath(t);
+
+  assert.equal(openAndClose({ databasePath, profile: 'demo' }).profile, 'demo');
+  assert.throws(
+    () => createAnalyticsRepository({ databasePath, model: loadModel(), profile: 'empty' }),
+    /conflicts with the database profile/,
+  );
+  const reopened = openAndClose({ databasePath });
+  assert.equal(reopened.profile, 'demo');
+  assert.equal(reopened.dashboard.source.state, 'current');
+});
+
+test('a database created before profiles existed is demo data, never an empty install', (t) => {
+  const databasePath = createTempDatabasePath(t);
+  openAndClose({ databasePath, profile: 'demo' });
+
+  forgetStoredProfile(databasePath);
+  assert.equal(openAndClose({ databasePath }).profile, 'demo');
+
+  forgetStoredProfile(databasePath);
+  assert.throws(
+    () => createAnalyticsRepository({ databasePath, model: loadModel(), profile: 'empty' }),
+    /conflicts with the database profile/,
+  );
 });

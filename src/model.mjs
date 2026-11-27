@@ -44,10 +44,14 @@ const contentModelSchema = z
           maximumAlertThreshold: z.number(),
           maximumActivityItems: z.number(),
         }),
+        source: z.object({
+          staleAfterHours: z.number().positive(),
+        }),
         reports: z.object({
           recordTypes: z.object({
             store: z.string(),
             product: z.string(),
+            source: z.string(),
           }),
           csvHeaders: z.array(z.string()),
         }),
@@ -120,6 +124,7 @@ export function loadModel() {
     copy: envelope.messages,
     filters: envelope.data.filters,
     validation: envelope.data.validation,
+    source: envelope.data.source,
     reports: envelope.data.reports,
     seed: envelope.data.seed,
   };

@@ -13,8 +13,9 @@ import {
   isAlertTriggered,
   mapPerformance,
 } from './analytics.metrics.mjs';
-import { getProductConditions, getSalesRows } from './analytics.query.mjs';
+import { getProductConditions, getSalesRows, getSourceActivity } from './analytics.query.mjs';
 import { seedSales } from './analytics.seed.mjs';
+import { SOURCE_STATES, buildSource, establishProfile } from './analytics.source.mjs';
 
 function executeTransaction(database, work) {
   database.exec('BEGIN IMMEDIATE');
@@ -28,7 +29,7 @@ function executeTransaction(database, work) {
   }
 }
 
-export function createAnalyticsRepository({ databasePath, model }) {
+export function createAnalyticsRepository({ databasePath, model, profile: requestedProfile }) {
   const database = new DatabaseSync(databasePath);
   database.exec(`
     PRAGMA foreign_keys = ON;
@@ -95,6 +96,7 @@ export function createAnalyticsRepository({ databasePath, model }) {
     );
     CREATE INDEX IF NOT EXISTS activity_events_time_idx ON activity_events(occurred_at);
   `);
+  const profile = establishProfile(database, requestedProfile);
 
   const insertStore = database.prepare(`
     INSERT OR IGNORE INTO stores
@@ -131,7 +133,7 @@ export function createAnalyticsRepository({ databasePath, model }) {
         product.category,
         product.unitPriceCents,
         product.unitCostCents,
-        product.stockOnHand,
+        profile === 'demo' ? product.stockOnHand : 0,
         product.displayOrder,
       );
     }
@@ -152,7 +154,7 @@ export function createAnalyticsRepository({ databasePath, model }) {
     database
       .prepare('INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)')
       .run('seed_version', String(model.seed.version));
-    seedSales(database, model, new Date());
+    if (profile === 'demo') seedSales(database, model, new Date());
   });
 
   function getMetrics(filters, range) {
@@ -236,14 +238,24 @@ export function createAnalyticsRepository({ databasePath, model }) {
     return [...grouped.entries()].map(([id, metrics]) => ({ id, ...metrics }));
   }
 
-  function getDashboard(filters) {
-    const today = new Date();
+  function getSource(filters, now, current) {
+    return buildSource({
+      profile,
+      activity: getSourceActivity(database, { filters, range: current, now }),
+      days: filters.days,
+      now,
+      staleAfterHours: model.source.staleAfterHours,
+    });
+  }
+
+  function getDashboard(filters, today = new Date()) {
     const current = createRange(filters.days, today);
     const previous = createRange(filters.days, new Date(new Date(current.start).getTime() - DAY_MS));
     const ranges = { current, previous };
     const metrics = mapPerformance(getMetrics(filters, current), getMetrics(filters, previous));
     return {
       period: { days: filters.days, from: formatDay(new Date(current.start)), to: formatDay(today) },
+      source: getSource(filters, today, current),
       metrics,
       series: getSeries(filters, ranges, filters.days),
       stores: getStorePerformance(filters, ranges),
@@ -289,8 +301,9 @@ export function createAnalyticsRepository({ databasePath, model }) {
     );
   }
 
-  function getAlerts(filters) {
-    const metrics = getDashboard(filters).metrics;
+  function getAlerts(filters, now = new Date()) {
+    const { metrics, source } = getDashboard(filters, now);
+    const hasInput = source.state !== SOURCE_STATES.awaitingFirstSale;
     return database
       .prepare(
         `SELECT id, title, description, metric_key AS metricKey, operator, threshold,
@@ -303,7 +316,7 @@ export function createAnalyticsRepository({ databasePath, model }) {
           ...alert,
           enabled: Boolean(alert.enabled),
           value,
-          triggered: isAlertTriggered(alert.operator, value, alert.threshold),
+          triggered: hasInput && isAlertTriggered(alert.operator, value, alert.threshold),
         };
       });
   }
@@ -398,6 +411,7 @@ export function createAnalyticsRepository({ databasePath, model }) {
     getProduct,
     getProductBreakdown,
     getProducts,
+    getProfile: () => profile,
     getStore,
     getStorePerformance,
     ingestSales,
